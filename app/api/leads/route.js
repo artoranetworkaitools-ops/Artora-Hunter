@@ -1,39 +1,82 @@
 import { NextResponse } from "next/server";
 
-const GOOGLE_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const HUNTER_KEY = process.env.HUNTER_API_KEY;
 
 // How many businesses to enrich with contact-person lookups per search.
-// Hunter's free tier is limited, so we cap this to keep costs predictable.
+// Hunter's free tier is limited, so we cap this to keep usage predictable.
 const ENRICH_LIMIT = 8;
 
 function extractDomain(url) {
   try {
-    const u = new URL(url);
+    const u = new URL(url.startsWith("http") ? url : `https://${url}`);
     return u.hostname.replace(/^www\./, "");
   } catch {
     return null;
   }
 }
 
-async function textSearch(query) {
-  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(
-    query
-  )}&key=${GOOGLE_KEY}`;
-  const res = await fetch(url);
+// Free geocoding — turns "Lahore, Pakistan" into a bounding box.
+// No API key required. Nominatim's usage policy just asks for a
+// descriptive User-Agent, which we set below.
+async function geocodeLocation(location) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(
+    location
+  )}`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "LeadScout/1.0 (personal lead-gen tool)" },
+  });
   const data = await res.json();
-  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-    throw new Error(`Google Places error: ${data.status} ${data.error_message || ""}`);
-  }
-  return data.results || [];
+  if (!data || data.length === 0) return null;
+  const [south, north, west, east] = data[0].boundingbox.map(Number);
+  return { south, north, west, east };
 }
 
-async function placeDetails(placeId) {
-  const fields = "name,formatted_address,formatted_phone_number,website,rating,user_ratings_total";
-  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=${fields}&key=${GOOGLE_KEY}`;
-  const res = await fetch(url);
+// Free business search — no API key required. Overpass indexes
+// OpenStreetMap data; coverage is best for well-mapped cities and
+// weaker in smaller towns, but it costs nothing and has no card requirement.
+async function overpassSearch(niche, bbox) {
+  const { south, west, north, east } = bbox;
+  const bboxStr = `${south},${west},${north},${east}`;
+  const escaped = niche.replace(/["\\]/g, "");
+
+  const query = `
+    [out:json][timeout:25];
+    (
+      node["name"~"${escaped}",i](${bboxStr});
+      way["name"~"${escaped}",i](${bboxStr});
+      node["shop"~"${escaped}",i](${bboxStr});
+      node["amenity"~"${escaped}",i](${bboxStr});
+      node["office"~"${escaped}",i](${bboxStr});
+    );
+    out center tags 30;
+  `;
+
+  const res = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    body: query,
+    headers: { "Content-Type": "text/plain" },
+  });
+  if (!res.ok) throw new Error(`Overpass error: ${res.status}`);
   const data = await res.json();
-  return data.result || {};
+  return data.elements || [];
+}
+
+function elementToBusiness(el) {
+  const t = el.tags || {};
+  const addressParts = [
+    t["addr:housenumber"],
+    t["addr:street"],
+    t["addr:city"],
+  ].filter(Boolean);
+
+  return {
+    name: t.name || null,
+    address: addressParts.length ? addressParts.join(" ") : t["addr:full"] || null,
+    phone: t.phone || t["contact:phone"] || null,
+    website: t.website || t["contact:website"] || null,
+    rating: null,
+    reviews: null,
+  };
 }
 
 async function hunterDomainSearch(domain) {
@@ -57,24 +100,21 @@ async function hunterDomainSearch(domain) {
 }
 
 export async function POST(request) {
-  if (!GOOGLE_KEY) {
-    return NextResponse.json(
-      { error: "GOOGLE_PLACES_API_KEY is not configured on the server." },
-      { status: 500 }
-    );
-  }
-
   const { niche, location } = await request.json();
   if (!niche || !location) {
     return NextResponse.json({ error: "niche and location are required" }, { status: 400 });
   }
 
   try {
-    const results = await textSearch(`${niche} in ${location}`);
+    const bbox = await geocodeLocation(location);
+    if (!bbox) {
+      return NextResponse.json({ error: `Could not find location "${location}".` }, { status: 404 });
+    }
 
-    const businesses = await Promise.all(
-      results.slice(0, 20).map((r) => placeDetails(r.place_id))
-    );
+    const elements = await overpassSearch(niche, bbox);
+    const businesses = elements
+      .map(elementToBusiness)
+      .filter((b) => b.name); // drop unnamed nodes
 
     const enriched = await Promise.all(
       businesses.map(async (biz, i) => {
@@ -83,15 +123,7 @@ export async function POST(request) {
           const domain = extractDomain(biz.website);
           if (domain) contacts = await hunterDomainSearch(domain);
         }
-        return {
-          name: biz.name || null,
-          address: biz.formatted_address || null,
-          phone: biz.formatted_phone_number || null,
-          website: biz.website || null,
-          rating: biz.rating || null,
-          reviews: biz.user_ratings_total || null,
-          contacts,
-        };
+        return { ...biz, contacts };
       })
     );
 
