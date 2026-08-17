@@ -51,14 +51,37 @@ async function overpassSearch(niche, bbox) {
     out center tags 30;
   `;
 
-  const res = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    body: query,
-    headers: { "Content-Type": "text/plain" },
-  });
-  if (!res.ok) throw new Error(`Overpass error: ${res.status}`);
-  const data = await res.json();
-  return data.elements || [];
+  // overpass-api.de (the default public instance) intermittently returns
+  // 406 errors when overloaded. Try a couple of mirrors so a single
+  // server having a bad day doesn't take the whole app down.
+  const endpoints = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+  ];
+
+  let lastError;
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        body: query,
+        headers: {
+          "Content-Type": "text/plain",
+          Accept: "application/json",
+        },
+      });
+      if (!res.ok) {
+        lastError = new Error(`Overpass error: ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      return data.elements || [];
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("All Overpass endpoints failed.");
 }
 
 function elementToBusiness(el) {
