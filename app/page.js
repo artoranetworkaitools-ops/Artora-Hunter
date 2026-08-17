@@ -112,8 +112,8 @@ export default function Home() {
 
           {error && <div className="error">{error}</div>}
           <div className="hint">
-            Needs GOOGLE_PLACES_API_KEY (required) and HUNTER_API_KEY (optional, for contact emails) —
-            see the README.
+            Free to run — uses OpenStreetMap for business data. Add HUNTER_API_KEY
+            (optional, free tier) for contact emails — see the README.
           </div>
         </div>
 
@@ -184,7 +184,7 @@ export default function Home() {
       </section>
 
       <footer>
-        LeadScout uses Google Places for business data and Hunter.io for public contact
+        LeadScout uses OpenStreetMap for business data and Hunter.io for public contact
         discovery. Respect each platform's terms of use and local data-privacy law when
         contacting leads.
       </footer>
